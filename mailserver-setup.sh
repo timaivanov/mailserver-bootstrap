@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== Logging / error handling =====
+# =============== CONFIG / LOGGING ===============
 LOG_FILE="/root/mailserver-setup.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -9,16 +9,11 @@ log()  { echo -e "[+] $*"; }
 warn() { echo -e "[!] $*" >&2; }
 die()  { echo -e "[x] $*" >&2; exit 1; }
 
-on_err() {
-  warn "Script failed on line $1. Check log: $LOG_FILE"
-  warn "Last 80 lines:"
-  tail -n 80 "$LOG_FILE" || true
-}
-trap 'on_err $LINENO' ERR
+trap 'warn "Failed on line $LINENO. See: $LOG_FILE"; tail -n 120 "$LOG_FILE" || true' ERR
 
 need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (sudo)."; }
 
-# ===== Args =====
+# =============== ARGS ===============
 DOMAIN=""
 IP=""
 MAIL_HOST=""
@@ -26,6 +21,7 @@ SELECTOR="s1"
 SMTP_USER="mt"
 SMTP_PASS=""
 DMARC_POLICY="quarantine"
+POSTMASTER_EMAIL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,18 +32,21 @@ while [[ $# -gt 0 ]]; do
     --smtp-user) SMTP_USER="${2:-}"; shift 2;;
     --smtp-pass) SMTP_PASS="${2:-}"; shift 2;;
     --dmarc-policy) DMARC_POLICY="${2:-}"; shift 2;;
+    --email) POSTMASTER_EMAIL="${2:-}"; shift 2;;
     -h|--help)
       cat <<EOF
 Usage:
-  sudo bash $0 --domain example.com --ip 1.2.3.4 [--mail-host mail.example.com]
+  sudo bash $0 --domain example.com --ip 1.2.3.4 [--mail-host mail.example.com] [--email postmaster@example.com]
+
 Options:
   --domain         Root domain (example.com)
-  --ip             Server public IP
+  --ip             Server public IPv4
   --mail-host      Mail hostname (default: mail.\$domain)
   --selector       DKIM selector (default: s1)
   --smtp-user      SMTP user for Mailtrain (default: mt)
   --smtp-pass      SMTP password (default: auto-generate)
   --dmarc-policy   none|quarantine|reject (default: quarantine)
+  --email          Let's Encrypt contact email (default: postmaster@domain)
 EOF
       exit 0
       ;;
@@ -59,40 +58,42 @@ need_root
 [[ -n "$DOMAIN" ]] || die "--domain is required"
 [[ -n "$IP" ]] || die "--ip is required"
 [[ -n "$MAIL_HOST" ]] || MAIL_HOST="mail.${DOMAIN}"
+[[ -n "$POSTMASTER_EMAIL" ]] || POSTMASTER_EMAIL="postmaster@${DOMAIN}"
 [[ "$DMARC_POLICY" =~ ^(none|quarantine|reject)$ ]] || die "--dmarc-policy must be none|quarantine|reject"
 
 # Password generation WITHOUT SIGPIPE
 if [[ -z "${SMTP_PASS}" ]]; then
-  SMTP_PASS="$(openssl rand -hex 12)"  # 24 chars
+  SMTP_PASS="$(openssl rand -hex 12)" # 24 chars, stable
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-log "Starting setup for domain=${DOMAIN}, mail_host=${MAIL_HOST}, ip=${IP}"
-log "Log file: ${LOG_FILE}"
+log "Starting mailserver setup"
+log "DOMAIN=$DOMAIN IP=$IP MAIL_HOST=$MAIL_HOST SELECTOR=$SELECTOR"
+log "Log: $LOG_FILE"
 
-# ===== Packages =====
-log "Updating packages"
+# =============== PACKAGES ===============
+log "APT update"
 apt-get update -y
 
-log "Installing base packages"
-apt-get install -y ca-certificates curl openssl ufw dnsutils debconf-utils
+log "Install prerequisites"
+apt-get install -y ca-certificates curl openssl ufw dnsutils debconf-utils dos2unix
 
 # Preseed postfix to avoid interactive prompts
 echo "postfix postfix/mailname string ${MAIL_HOST}" | debconf-set-selections
 echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections
 
-log "Installing mail stack packages"
+log "Install mail packages"
 apt-get install -y postfix postfix-pcre dovecot-core dovecot-imapd opendkim opendkim-tools opendmarc certbot
 
-# ===== Hostname =====
-log "Setting hostname: ${MAIL_HOST}"
+# =============== HOSTNAME ===============
+log "Set hostname"
 hostnamectl set-hostname "${MAIL_HOST}" || true
 
-# ===== Firewall =====
-log "Configuring firewall (ufw)"
+# =============== FIREWALL ===============
+log "Configure UFW"
 ufw allow 22/tcp >/dev/null || true
-ufw allow 80/tcp >/dev/null || true   # IMPORTANT for certbot standalone
+ufw allow 80/tcp >/dev/null || true    # certbot standalone
 ufw allow 25/tcp >/dev/null || true
 ufw allow 587/tcp >/dev/null || true
 ufw allow 993/tcp >/dev/null || true
@@ -100,30 +101,39 @@ ufw --force enable >/dev/null || true
 ufw reload >/dev/null || true
 ufw status || true
 
-# ===== TLS (Let's Encrypt standalone) =====
+# =============== CERTBOT (standalone) ===============
 CERT_CHAIN="/etc/letsencrypt/live/${MAIL_HOST}/fullchain.pem"
 CERT_KEY="/etc/letsencrypt/live/${MAIL_HOST}/privkey.pem"
 
-log "Issuing Let's Encrypt cert for ${MAIL_HOST} (standalone on :80)"
+log "Issue/renew Let's Encrypt cert for ${MAIL_HOST}"
 systemctl stop nginx apache2 2>/dev/null || true
 
-if certbot certonly --standalone -n --agree-tos -m "postmaster@${DOMAIN}" -d "${MAIL_HOST}"; then
-  log "Certbot OK: ${CERT_CHAIN}"
+if certbot certonly --standalone -n --agree-tos -m "${POSTMASTER_EMAIL}" -d "${MAIL_HOST}"; then
+  log "Cert OK: ${CERT_CHAIN}"
 else
-  warn "Certbot failed. TLS will be configured to snakeoil as fallback."
+  warn "Certbot failed. We'll use snakeoil TLS for now."
 fi
 
-# ===== Dovecot =====
-log "Configuring Dovecot (SMTP AUTH socket + IMAPS)"
+# TLS fallback
+if [[ -f "${CERT_CHAIN}" && -f "${CERT_KEY}" ]]; then
+  SSL_CERT_PATH="${CERT_CHAIN}"
+  SSL_KEY_PATH="${CERT_KEY}"
+else
+  SSL_CERT_PATH="/etc/ssl/certs/ssl-cert-snakeoil.pem"
+  SSL_KEY_PATH="/etc/ssl/private/ssl-cert-snakeoil.key"
+fi
 
-# Ensure vmail exists (optional but safe)
+# =============== DOVECOT (SMTP AUTH + IMAPS) ===============
+log "Configure Dovecot"
+
+# Create vmail (optional)
 if ! id vmail >/dev/null 2>&1; then
   useradd -r -u 5000 -g mail -d /var/mail/vhosts -s /usr/sbin/nologin vmail || true
 fi
 mkdir -p /var/mail/vhosts
 chown -R vmail:mail /var/mail/vhosts
 
-# passwd-file for SMTP AUTH (NOT PAM)
+# passwd-file for SMTP AUTH user (Mailtrain)
 mkdir -p /etc/dovecot/passwd
 HASH="$(doveadm pw -s SHA512-CRYPT -p "${SMTP_PASS}")"
 echo "${SMTP_USER}:${HASH}" > "/etc/dovecot/passwd/${DOMAIN}.pass"
@@ -131,7 +141,14 @@ chown root:dovecot "/etc/dovecot/passwd/${DOMAIN}.pass"
 chmod 640 "/etc/dovecot/passwd/${DOMAIN}.pass"
 chmod 755 /etc/dovecot/passwd
 
-# Enable passwd-file auth explicitly
+# Force auth to passwd-file only (no PAM)
+cat >/etc/dovecot/conf.d/10-auth.conf <<'EOF'
+disable_plaintext_auth = no
+auth_mechanisms = plain login
+
+!include auth-passwdfile.conf.ext
+EOF
+
 cat >/etc/dovecot/conf.d/auth-passwdfile.conf.ext <<EOF
 passdb {
   driver = passwd-file
@@ -143,17 +160,7 @@ userdb {
 }
 EOF
 
-# Disable PAM auth (so doveconf doesn't show "passdb pam")
-# On Ubuntu, 10-auth.conf includes auth-system.conf.ext by default.
-# We'll override it to only include passwdfile.
-cat >/etc/dovecot/conf.d/10-auth.conf <<'EOF'
-disable_plaintext_auth = no
-auth_mechanisms = plain login
-
-!include auth-passwdfile.conf.ext
-EOF
-
-# 10-master.conf MUST be multiline (fixes your "Garbage after '{'")
+# IMPORTANT: multiline blocks only (fixes "Garbage after '{'")
 cat >/etc/dovecot/conf.d/10-master.conf <<'EOF'
 service imap-login {
   inet_listener imap {
@@ -174,23 +181,15 @@ service auth {
 }
 EOF
 
-# TLS config: if cert missing, use snakeoil fallback
-if [[ -f "${CERT_CHAIN}" && -f "${CERT_KEY}" ]]; then
-  SSL_CERT_PATH="${CERT_CHAIN}"
-  SSL_KEY_PATH="${CERT_KEY}"
-else
-  SSL_CERT_PATH="/etc/ssl/certs/ssl-cert-snakeoil.pem"
-  SSL_KEY_PATH="/etc/ssl/private/ssl-cert-snakeoil.key"
-  warn "Using snakeoil TLS cert for Dovecot/Postfix until Let's Encrypt is issued."
-fi
-
 cat >/etc/dovecot/conf.d/10-ssl.conf <<EOF
 ssl = required
 ssl_cert = <${SSL_CERT_PATH}
 ssl_key = <${SSL_KEY_PATH}
 EOF
 
-# Ensure socket path exists
+# CRLF protection
+dos2unix /etc/dovecot/conf.d/10-auth.conf /etc/dovecot/conf.d/10-master.conf /etc/dovecot/conf.d/10-ssl.conf /etc/dovecot/conf.d/auth-passwdfile.conf.ext >/dev/null 2>&1 || true
+
 mkdir -p /var/spool/postfix/private
 chown postfix:postfix /var/spool/postfix/private
 chmod 755 /var/spool/postfix/private
@@ -199,23 +198,27 @@ systemctl enable --now dovecot >/dev/null
 systemctl restart dovecot
 systemctl status dovecot --no-pager -l
 
-# Quick sanity: confirm passwd-file auth is active
-log "Dovecot effective config check (expect passwd-file, not pam)"
+log "Dovecot config sanity (expect passwd-file)"
 doveconf -n | egrep -n 'passdb|passwd-file|pam' || true
 
-# ===== OpenDKIM =====
-log "Configuring OpenDKIM"
-mkdir -p /etc/opendkim/keys/${DOMAIN}
+# =============== OPENDKIM (IDEMPOTENT) ===============
+log "Configure OpenDKIM"
 
+mkdir -p "/etc/opendkim/keys/${DOMAIN}"
 DKIM_PRIV="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
 DKIM_PUB="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
 
-if [[ ! -f "${DKIM_PRIV}" ]]; then
-  opendkim-genkey -b 2048 -d "${DOMAIN}" -D "/etc/opendkim/keys/${DOMAIN}" -s "${SELECTOR}"
-  mv -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" "${DKIM_PRIV}"
-  mv -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" "${DKIM_PUB}"
+if [[ -f "${DKIM_PRIV}" && -f "${DKIM_PUB}" ]]; then
+  log "OpenDKIM keys already exist: ${DKIM_PRIV}"
+else
+  tmpdir="$(mktemp -d)"
+  opendkim-genkey -b 2048 -d "${DOMAIN}" -D "${tmpdir}" -s "${SELECTOR}"
+  install -o opendkim -g opendkim -m 0600 "${tmpdir}/${SELECTOR}.private" "${DKIM_PRIV}"
+  install -o opendkim -g opendkim -m 0644 "${tmpdir}/${SELECTOR}.txt" "${DKIM_PUB}"
+  rm -rf "${tmpdir}"
 fi
 
+# Make sure ownership is correct everywhere
 chown -R opendkim:opendkim /etc/opendkim
 chmod 0750 /etc/opendkim/keys "/etc/opendkim/keys/${DOMAIN}"
 chmod 0600 "${DKIM_PRIV}"
@@ -235,7 +238,6 @@ cat >/etc/opendkim/SigningTable <<EOF
 *@${DOMAIN} ${SELECTOR}._domainkey.${DOMAIN}
 EOF
 
-# Use refile: maps (your proven fix)
 cat >/etc/opendkim.conf <<EOF
 Syslog                  yes
 SyslogSuccess           yes
@@ -263,12 +265,13 @@ systemctl status opendkim --no-pager -l
 
 opendkim-testkey -d "${DOMAIN}" -s "${SELECTOR}" -k "${DKIM_PRIV}" -vvv >/tmp/opendkim-testkey.txt 2>&1 || true
 
-# ===== OpenDMARC =====
-log "Configuring OpenDMARC"
+# =============== OPENDMARC ===============
+log "Configure OpenDMARC"
 mkdir -p /etc/opendmarc /run/opendmarc
 chown opendmarc:opendmarc /run/opendmarc
 chmod 755 /run/opendmarc
 
+# Fix "No such file" we hit before
 cat >/etc/opendmarc/ignore.hosts <<EOF
 127.0.0.1
 localhost
@@ -289,8 +292,8 @@ systemctl enable --now opendmarc >/dev/null
 systemctl restart opendmarc
 systemctl status opendmarc --no-pager -l || true
 
-# ===== Postfix =====
-log "Configuring Postfix"
+# =============== POSTFIX ===============
+log "Configure Postfix"
 postconf -e "myhostname = ${MAIL_HOST}"
 postconf -e "mydomain = ${DOMAIN}"
 postconf -e "myorigin = \$mydomain"
@@ -316,7 +319,7 @@ postconf -e "milter_default_action = accept"
 postconf -e "smtpd_milters = inet:127.0.0.1:8891, inet:127.0.0.1:8893"
 postconf -e "non_smtpd_milters = inet:127.0.0.1:8891, inet:127.0.0.1:8893"
 
-# submission service
+# Ensure submission service exists (587)
 if ! grep -qE '^submission\s+inet' /etc/postfix/master.cf; then
   cat >>/etc/postfix/master.cf <<'EOF'
 
@@ -332,17 +335,27 @@ submission inet n       -       y       -       -       smtpd
 EOF
 fi
 
-# Disable TLS1.3 on submission (your recurring pain)
-if ! grep -q 'smtpd_tls_protocols=.*TLSv1.3' /etc/postfix/master.cf; then
-  perl -i -pe 'if(/^submission inet/){$in=1} elsif($in && /^\S/){$in=0} if($in && /milter_macro_daemon_name=ORIGINATING/){$_ .= "  -o smtpd_tls_protocols=!SSLv2,!SSLv3,!TLSv1,!TLSv1.1,!TLSv1.3\n  -o smtpd_tls_mandatory_protocols=!SSLv2,!SSLv3,!TLSv1,!TLSv1.1,!TLSv1.3\n"}' /etc/postfix/master.cf
+# Disable TLS1.3 on submission to avoid weird STARTTLS client issues
+# Add only once.
+if ! awk 'BEGIN{in=0;added=0} /^submission inet/{in=1} in && /smtpd_tls_mandatory_protocols/ {added=1} END{exit added?0:1}' /etc/postfix/master.cf; then
+  perl -i -pe '
+    if(/^submission inet/){$in=1}
+    elsif($in && /^\S/){$in=0}
+    if($in && /milter_macro_daemon_name=ORIGINATING/){
+      $_ .= "  -o smtpd_tls_protocols=!SSLv2,!SSLv3,!TLSv1,!TLSv1.1,!TLSv1.3\n";
+      $_ .= "  -o smtpd_tls_mandatory_protocols=!SSLv2,!SSLv3,!TLSv1,!TLSv1.1,!TLSv1.3\n";
+    }
+  ' /etc/postfix/master.cf
 fi
 
 systemctl enable --now postfix >/dev/null
 systemctl restart postfix
 systemctl status postfix --no-pager -l
 
-# ===== Output =====
-log "Preparing final output"
+# =============== FINAL OUTPUT ===============
+log "Prepare final output"
+
+# DKIM value formatting: remove header/footer and collapse whitespace
 DKIM_TXT_RAW="$(sed '1d;$d' "${DKIM_PUB}" 2>/dev/null | tr -d '\n' | sed -E 's/[[:space:]]+/ /g' || true)"
 
 OUT="/root/MAILSERVER_${DOMAIN}.txt"
@@ -391,7 +404,7 @@ DNS RECORDS TO ADD:
 
 NOTES:
   - Set PTR/rDNS for ${IP} to: ${MAIL_HOST}
-  - Ensure outbound 25 is open (provider may block it)
+  - Provider must allow outbound 25 (some block it)
   - Test STARTTLS:
       openssl s_client -starttls smtp -connect ${MAIL_HOST}:587 -servername ${MAIL_HOST}
 
@@ -410,5 +423,5 @@ echo "==================== IMPORTANT OUTPUT ===================="
 cat "${OUT}"
 echo "=========================================================="
 echo
-log "Saved also to: ${OUT}"
+log "Saved: ${OUT}"
 log "Done."
